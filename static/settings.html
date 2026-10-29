@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Settings - SSSE</title>
+<meta name="robots" content="noindex,nofollow">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<header class="header">
+  <div class="brand" id="brand"></div>
+  <nav class="topnav"><a href="/">Home</a></nav>
+</header>
+<main>
+  <h1>Settings</h1>
+  <section id="loginSection">
+    <h2>Login</h2>
+    <form id="loginForm">
+      <input id="username" placeholder="username">
+      <input id="password" type="password" placeholder="password">
+      <button type="submit">Login</button>
+    </form>
+  </section>
+  <section id="adminSection" style="display:none">
+    <h2>Server Settings</h2>
+    <form id="settingsForm"></form>
+    <h2>Seed URLs</h2>
+    <textarea id="seeds"></textarea>
+    <button id="saveSeeds">Save Seeds</button>
+    <h2>Crawl Controls</h2>
+    <button id="crawlStart">Start</button>
+    <button id="crawlStop">Stop</button>
+    <button id="crawlRestart">Restart</button>
+    <pre id="crawlStatus"></pre>
+    <h2>Browser Preferences</h2>
+    <select id="theme">
+      <option value="system">Follow System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <input type="file" id="bgFile" accept="image/*">
+    <div id="bgPreview"></div>
+    <button id="removeBg">Remove Background</button>
+    <div id="rpp"></div>
+  </section>
+</main>
+<script type="module" src="/js/settings.js"></script>
+</body>
+</html>
