@@ -29,6 +29,36 @@ implement DNS filtering or guarantee that accessible content is safe or accurate
 - A successful crawl atomically replaces all published data. A stopped or failed
   crawl preserves the previous index. Interrupted staging is discarded at startup.
 
+### Sitemaps, canonical hints, and refreshed restrictions
+
+Sitemaps are discovered from robots declarations and HTML `link rel="sitemap"`
+hints. If robots declares none, SSSE probes `/sitemap.xml` and `/sitemap_index.xml`
+once per discovered origin. Namespace-aware URL sets, nested indexes, gzip files,
+and HTTP gzip encoding are supported. The response-size limit bounds both received
+and decompressed content; `0` leaves these limits disabled.
+
+Depth is discovery distance, not the number of slashes in a URL. Sitemap metadata
+retains its referring page's depth/domain through nested indexes, even on another
+host. Within-domain page entries add one discovery step; external page entries
+start at zero. Sitemap wrappers do not grant extra depth or reset it. Consequently,
+a large sitemap can still offer many pages at the same depth; depth is not a
+total-page limit. Sitemap documents are metadata, never searchable results.
+
+Canonical hints are not redirects or permission overrides. SSSE considers
+same-origin HTTPS hints, fetches their targets through ordinary eligibility/depth
+checks, and consolidates only accepted pages with duplicate extracted text.
+Missing, refused, different-content, cross-origin, and conflicting targets leave
+the original page intact. Chains resolve to their accepted endpoint; cycles use
+the lexicographically smallest cycle URL. News/video entries and image referring
+URLs follow the representative during atomic publication. Canonical hints do not
+add popularity points or override `nofollow`.
+
+When robots rules refresh, newly prohibited pending tasks are removed from SQLite
+and the FIFO, with one refusal per removed task. Leased workers remain accounted
+for until they acknowledge completion and recheck restrictions before fetching.
+Requests already sent cannot be retroactively unsent. Newly declared sitemaps are
+discovered using the origin's existing depth context.
+
 ### Crawler settings
 
 Settings, seeds, domain bans, word bans and promotions are stored in SQLite and

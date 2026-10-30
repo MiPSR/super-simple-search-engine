@@ -20,12 +20,12 @@ pub fn open(path: &Path) -> Result<Connection> {
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 2 {
+    if version > 3 {
         return Err(rusqlite::Error::InvalidParameterName(
             "database schema is newer than this application; refusing to downgrade".into(),
         ));
     }
-    if version == 2 {
+    if version == 3 {
         return Ok(());
     }
     let tx = conn.unchecked_transaction()?;
@@ -59,7 +59,16 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "details",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
-    conn.execute_batch("PRAGMA user_version=2;")?;
+    add_column(conn, "crawl_queue", "kind", "TEXT NOT NULL DEFAULT 'page'")?;
+    add_column(conn, "crawl_queue", "scope", "TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "crawl_queue", "origin", "TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "crawl_queue", "parent_depth", "INTEGER")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS crawl_canonicals(source TEXT PRIMARY KEY,target TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS crawl_aliases(alias TEXT PRIMARY KEY,target TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS crawl_queue_origin ON crawl_queue(origin);
+        PRAGMA user_version=3;",
+    )?;
     tx.commit()
 }
 
@@ -84,7 +93,8 @@ pub fn cleanup(conn: &Connection) -> Result<()> {
         DELETE FROM staging_news; DELETE FROM staging_domains; DELETE FROM staging_refused_urls;
         DELETE FROM staging_http_responses; DELETE FROM staging_robots; DELETE FROM crawl_queue;
         DELETE FROM crawl_seen_urls; DELETE FROM crawl_domains; DELETE FROM crawl_robots;
-        DELETE FROM crawl_responses; DELETE FROM crawl_refused_urls; DELETE FROM crawl_links;",
+        DELETE FROM crawl_responses; DELETE FROM crawl_refused_urls; DELETE FROM crawl_links;
+        DELETE FROM crawl_canonicals; DELETE FROM crawl_aliases;",
     )?;
     tx.commit()
 }

@@ -651,6 +651,18 @@ Every sitemap-derived URL must undergo the same HTTPS, domain, ban-list, duplica
 
 Sitemaps must not override seed-based crawl initialization.
 
+Support namespace-aware URL sets and nested sitemap indexes, including gzip files
+and HTTP compression. Bound compressed and decompressed bodies using the configured
+response limit; zero disables that limit. Use robots declarations, HTML sitemap
+links, and conventional `/sitemap.xml` and `/sitemap_index.xml` fallback locations.
+
+Sitemap metadata retains its referring page's registrable-domain/depth context
+through nested indexes, including cross-host indexes. Internal page entries add one
+discovery step and external page entries start at zero. Metadata wrappers do not
+consume page depth or create a fresh depth allowance. Explicit sitemap seeds use
+depth zero as their metadata anchor. Depth measures discovery distance, not URL
+path segments or a total page count.
+
 ---
 
 ## 7. URL and File Handling
@@ -760,6 +772,14 @@ Normalize extracted text for indexing.
 Do not store unnecessary HTML markup.
 
 Avoid indexing navigation boilerplate and duplicated interface text where practical.
+
+Canonical hints are applied conservatively: only same-origin HTTPS targets that
+independently pass normal crawl/index restrictions and have duplicate extracted
+text may consolidate pages. Missing, rejected, different-content, cross-origin,
+or conflicting hints preserve the source. Canonical discovery obeys depth limits
+and nofollow. Resolve chains to their accepted endpoint and cycles to a stable
+lexicographically smallest cycle URL. Consolidate associated news/video entries
+and image referring URLs atomically, without adding canonical popularity points.
 
 ### 8.2. JavaScript Websites
 

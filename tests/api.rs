@@ -509,3 +509,59 @@ async fn searches_remain_consistent_during_republication() {
     }
     task.await.unwrap();
 }
+
+#[test]
+fn version_two_upgrade_preserves_settings_credentials_history_and_published_index() {
+    let (_dir, state) = setup();
+    publish(&state);
+    ssse::settings::set(&state.db(), "max_depth", "0");
+    ssse::auth::set_password(&mut state.db(), "admin", "upgrade-secret").unwrap();
+    let conn = state.db();
+    conn.execute_batch(
+        "DROP INDEX crawl_queue_origin;
+        ALTER TABLE crawl_queue DROP COLUMN parent_depth;
+        ALTER TABLE crawl_queue DROP COLUMN origin;
+        ALTER TABLE crawl_queue DROP COLUMN scope;
+        ALTER TABLE crawl_queue DROP COLUMN kind;
+        DROP TABLE crawl_aliases; DROP TABLE crawl_canonicals;
+        PRAGMA user_version=2;",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO crawl_queue(url,depth,assigned,created_at) VALUES('https://unfinished.example/',1,1,1)",[]).unwrap();
+    drop(conn);
+    db::init(&state.db_path).unwrap();
+    let conn = state.db();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pages", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM crawl_history", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM crawl_queue", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(ssse::settings::load(&conn).max_depth, 0);
+    assert!(ssse::auth::check_login(&conn, "admin", "upgrade-secret"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM pages_fts WHERE pages_fts MATCH 'hello'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+}

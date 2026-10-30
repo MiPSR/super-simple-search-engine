@@ -1827,6 +1827,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",
