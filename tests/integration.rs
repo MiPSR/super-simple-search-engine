@@ -136,7 +136,10 @@ fn db_migration_idempotent() {
 
 #[test]
 fn fts_query_operators() {
-    assert_eq!(ssse::api::build_fts_query("hello world"), "hello world");
+    assert_eq!(
+        ssse::api::build_fts_query("hello world"),
+        "\"hello\" AND \"world\""
+    );
     assert!(ssse::api::build_fts_query("-spam hello").contains("NOT"));
     assert!(ssse::api::build_fts_query("site:example.com hello").contains("hello"));
 }
@@ -178,7 +181,11 @@ fn url_validation_extra() {
 
 #[test]
 fn banned_word_empty() {
-    assert!(!ssse::crawler::banned_word_matches("", "substring", "anything"));
+    assert!(!ssse::crawler::banned_word_matches(
+        "",
+        "substring",
+        "anything"
+    ));
 }
 
 #[test]

@@ -4,5 +4,6 @@ pkgs.mkShell {
     cargo rustc rustfmt clippy rust-analyzer
     pkg-config openssl sqlite
     gcc
+    nodejs
   ];
 }

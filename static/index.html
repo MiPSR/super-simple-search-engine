@@ -5,13 +5,15 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Super Simple Search Engine</title>
 <meta name="robots" content="noindex,nofollow">
+<script src="/js/theme.js"></script>
 <link rel="stylesheet" href="/css/style.css">
+<link rel="search" type="application/opensearchdescription+xml" title="SSSE" href="/opensearch.xml">
 </head>
 <body>
 <a href="#main" class="skip-link">Skip to content</a>
 <header id="header" class="header">
   <div class="brand" id="brand"></div>
-  <form id="searchForm" class="search-form" style="display:none">
+  <form id="searchForm" class="search-form" hidden>
     <input id="q" type="search" aria-label="Search query">
     <button type="submit">Search</button>
   </form>
@@ -29,19 +31,20 @@
       <button type="submit">Search</button>
     </form>
   </section>
-  <section id="results" class="results" style="display:none">
-    <div class="tabs">
+  <section id="results" class="results" hidden>
+    <div class="tabs" role="group" aria-label="Search category">
       <button data-cat="PAGES">PAGES</button>
       <button data-cat="IMAGES">IMAGES</button>
       <button data-cat="VIDEOS">VIDEOS</button>
       <button data-cat="NEWS">NEWS</button>
     </div>
+    <p id="searchStatus" role="status" aria-live="polite"></p>
     <div id="resultList"></div>
-    <nav id="pagination"></nav>
+    <nav id="pagination" aria-label="Search result pages"></nav>
   </section>
 </main>
 
-<footer><a href="https://github.com">GitHub</a></footer>
+<footer><a href="https://github.com/MiPSR/super-simple-search-engine" rel="noreferrer">GitHub</a></footer>
 
 <script type="module" src="/js/app.js"></script>
 </body>

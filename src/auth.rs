@@ -24,16 +24,16 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
     }
 }
 
-pub fn create_session(conn: &Connection, username: &str) -> String {
+pub fn create_session(conn: &Connection, username: &str) -> rusqlite::Result<String> {
     let token = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
     let exp = now + 86400;
     conn.execute(
         "INSERT INTO sessions(token,username,created_at,expires_at) VALUES(?1,?2,?3,?4)",
         rusqlite::params![token, username, now, exp],
-    )
-    .ok();
-    token
+    )?;
+    conn.execute("DELETE FROM sessions WHERE expires_at<=?1", [now])?;
+    Ok(token)
 }
 
 pub fn validate_session(conn: &Connection, token: &str) -> bool {
@@ -55,15 +55,25 @@ pub fn has_credentials(conn: &Connection) -> bool {
         .is_ok()
 }
 
-pub fn set_password(conn: &Connection, username: &str, password: &str) {
+pub fn set_password(conn: &mut Connection, username: &str, password: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !username.trim().is_empty() && username.len() <= 128,
+        "username is required (maximum 128 bytes)"
+    );
+    anyhow::ensure!(
+        !password.is_empty() && password.len() <= 1024,
+        "password must contain 1–1024 bytes"
+    );
     let h = hash_password(password);
-    conn.execute("DELETE FROM credentials", []).ok();
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM credentials", [])?;
+    tx.execute(
         "INSERT INTO credentials(username,password_hash) VALUES(?1,?2)",
         rusqlite::params![username, h],
-    )
-    .ok();
-    invalidate_all(conn);
+    )?;
+    tx.execute("DELETE FROM sessions", [])?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn check_login(conn: &Connection, username: &str, password: &str) -> bool {

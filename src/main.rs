@@ -7,14 +7,24 @@ use ssse::{api, db, state};
 #[derive(Parser)]
 #[command(name = "ssse", version, about = "Super Simple Search Engine")]
 struct Cli {
-    #[arg(long, env = "SSSE_DATA_DIR", default_value = "/var/lib/ssse")]
+    #[arg(
+        long,
+        global = true,
+        env = "SSSE_DATA_DIR",
+        default_value = "./ssse-data"
+    )]
     data_dir: PathBuf,
 
-    #[arg(long, env = "SSSE_BIND", default_value = "127.0.0.1:3000")]
+    #[arg(
+        long,
+        global = true,
+        env = "SSSE_BIND",
+        default_value = "127.0.0.1:3000"
+    )]
     bind: String,
 
-    #[arg(long, env = "SSSE_SOCKET", default_value = "/run/ssse/ssse.sock")]
-    socket: PathBuf,
+    #[arg(long, global = true, env = "SSSE_SOCKET")]
+    socket: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Option<Commands>,
@@ -53,15 +63,43 @@ enum CrawlAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let socket = cli
+        .socket
+        .clone()
+        .unwrap_or_else(|| cli.data_dir.join("ssse.sock"));
 
     match cli.cmd {
         None | Some(Commands::Serve) => {
+            let new_directory = !cli.data_dir.exists();
             std::fs::create_dir_all(&cli.data_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if new_directory {
+                    std::fs::set_permissions(
+                        &cli.data_dir,
+                        std::fs::Permissions::from_mode(0o700),
+                    )?;
+                }
+            }
+            let instance_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(cli.data_dir.join("ssse.lock"))?;
+            instance_lock.try_lock().map_err(|e| {
+                anyhow::anyhow!("another instance is using this data directory: {e}")
+            })?;
             let db_path = cli.data_dir.join("ssse.db");
             db::init(&db_path)?;
-            let state = state::AppState::new(db_path.clone(), cli.socket.clone(), cli.bind.clone());
-            state.spawn_socket_listener();
-            state.spawn_scheduler();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            let state = state::AppState::new(db_path.clone(), socket.clone(), cli.bind.clone());
+            let socket_task = state.spawn_socket_listener().await?;
+            let scheduler = state.spawn_scheduler();
             info!("starting server on {}", cli.bind);
             let app = api::router(state.clone());
             let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
@@ -84,9 +122,14 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let _ = ctrl_c.await;
                     }
-                    state_sd.inner.lock().unwrap().crawl_running = false;
+                    if let Err(e) = state_sd.shutdown().await {
+                        tracing::error!(error=%e,"shutdown failed");
+                    }
                 })
                 .await?;
+            scheduler.abort();
+            socket_task.abort();
+            let _ = std::fs::remove_file(&socket);
             return Ok(());
         }
         _ => {}
@@ -94,33 +137,23 @@ async fn main() -> anyhow::Result<()> {
 
     // CLI commands (no DB init)
     match cli.cmd {
-        Some(Commands::Password { action }) => {
-            match action {
-                PasswordAction::Change { username } => {
-                    let user = username.unwrap_or_else(|| "admin".to_string());
-                    // read password securely
-                    eprint!("New password: ");
-                    // disable echo
-                    let _ = std::process::Command::new("stty").arg("-echo").status();
-                    let mut pw = String::new();
-                    std::io::stdin().read_line(&mut pw).ok();
-                    let _ = std::process::Command::new("stty").arg("echo").status();
-                    eprintln!();
-                    let pw = pw.trim().to_string();
-                    // send to socket
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    use tokio::net::UnixStream;
-                    let mut stream = UnixStream::connect(&cli.socket).await?;
-                    stream
-                        .write_all(format!("password_change\n{}\n{}\n", user, pw).as_bytes())
-                        .await?;
-                    stream.shutdown().await.ok();
-                    let mut buf = String::new();
-                    stream.read_to_string(&mut buf).await?;
-                    print!("{}", buf);
-                }
+        Some(Commands::Password { action }) => match action {
+            PasswordAction::Change { username } => {
+                let user = username.unwrap_or_else(|| "admin".to_string());
+                let pw = rpassword::prompt_password("New password: ")?;
+                let confirm = rpassword::prompt_password("Confirm password: ")?;
+                anyhow::ensure!(pw == confirm, "passwords do not match");
+                control_call(
+                    &socket,
+                    state::ControlRequest {
+                        command: "password_change".into(),
+                        username: Some(user),
+                        password: Some(pw),
+                    },
+                )
+                .await?;
             }
-        }
+        },
         Some(Commands::Crawl { action }) => {
             let msg = match action {
                 CrawlAction::Start => "crawl_start",
@@ -128,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 CrawlAction::Restart => "crawl_restart",
                 CrawlAction::Status => "crawl_status",
             };
-            cli_call(&cli.socket, msg).await?;
+            cli_call(&socket, msg).await?;
         }
         _ => {}
     }
@@ -136,12 +169,39 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_call(socket: &PathBuf, cmd: &str) -> anyhow::Result<()> {
+    control_call(
+        socket,
+        state::ControlRequest {
+            command: cmd.into(),
+            username: None,
+            password: None,
+        },
+    )
+    .await
+}
+
+async fn control_call(socket: &PathBuf, req: state::ControlRequest) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     let mut stream = UnixStream::connect(socket).await?;
-    stream.write_all(format!("{}\n", cmd).as_bytes()).await?;
+    stream
+        .write_all(format!("{}\n", serde_json::to_string(&req)?).as_bytes())
+        .await?;
+    stream.shutdown().await?;
     let mut buf = String::new();
-    stream.read_to_string(&mut buf).await?;
-    print!("{}", buf);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        stream.read_to_string(&mut buf),
+    )
+    .await??;
+    let response: serde_json::Value = serde_json::from_str(&buf)?;
+    anyhow::ensure!(
+        response["ok"] == true,
+        "{}",
+        response["error"]
+            .as_str()
+            .unwrap_or("control command failed")
+    );
+    println!("{}", serde_json::to_string_pretty(&response["data"])?);
     Ok(())
 }

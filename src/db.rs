@@ -3,22 +3,90 @@ use std::path::Path;
 
 pub fn init(path: &Path) -> Result<()> {
     let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(15))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     migrate(&conn)?;
     // discard incomplete staging/temp crawl data from interrupted runs
-    conn.execute_batch("DELETE FROM staging_pages; DELETE FROM staging_images; DELETE FROM staging_videos; DELETE FROM staging_news; DELETE FROM staging_domains; DELETE FROM staging_refused_urls; DELETE FROM staging_http_responses; DELETE FROM staging_robots; DELETE FROM crawl_queue; DELETE FROM crawl_seen_urls; DELETE FROM crawl_domains; DELETE FROM crawl_robots; DELETE FROM crawl_responses; DELETE FROM crawl_refused_urls; DELETE FROM crawl_links;").ok();
+    cleanup(&conn)?;
     Ok(())
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(15))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     Ok(conn)
 }
 
 pub fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > 2 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "database schema is newer than this application; refusing to downgrade".into(),
+        ));
+    }
+    if version == 2 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let conn = &tx;
     conn.execute_batch(SCHEMA)?;
+    // Version 1 databases already contain these tables; add indexes/triggers without
+    // replacing administrative settings or historical crawl snapshots.
+    conn.execute_batch("DROP TRIGGER IF EXISTS staging_pages_ai; DROP TABLE IF EXISTS staging_pages_fts;
+        CREATE INDEX IF NOT EXISTS crawl_queue_pending ON crawl_queue(assigned,id);
+        DELETE FROM crawl_queue WHERE id NOT IN (SELECT min(id) FROM crawl_queue GROUP BY url);
+        CREATE UNIQUE INDEX IF NOT EXISTS crawl_queue_url ON crawl_queue(url);
+        CREATE INDEX IF NOT EXISTS pages_domain ON pages(domain);
+        CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages BEGIN
+          INSERT INTO pages_fts(pages_fts,rowid,title,description,text) VALUES('delete',old.id,old.title,old.description,old.text);
+          INSERT INTO pages_fts(rowid,title,description,text) VALUES(new.id,new.title,new.description,new.text);
+        END;
+        CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(title,alt,content='images',content_rowid='id');
+        CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(title,description,content='videos',content_rowid='id');
+        CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(title,description,content='news',content_rowid='id');
+        INSERT INTO pages_fts(pages_fts) VALUES('rebuild');
+        INSERT INTO images_fts(images_fts) VALUES('rebuild');
+        INSERT INTO videos_fts(videos_fts) VALUES('rebuild');
+        INSERT INTO news_fts(news_fts) VALUES('rebuild');
+        PRAGMA user_version=1;")?;
+    for table in ["http_responses", "staging_http_responses"] {
+        add_column(conn, table, "duration_ms", "INTEGER")?;
+    }
+    add_column(
+        conn,
+        "crawl_history",
+        "details",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    conn.execute_batch("PRAGMA user_version=2;")?;
+    tx.commit()
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let columns = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns.iter().any(|c| c == column) {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
     Ok(())
+}
+
+pub fn cleanup(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        DELETE FROM staging_pages; DELETE FROM staging_images; DELETE FROM staging_videos;
+        DELETE FROM staging_news; DELETE FROM staging_domains; DELETE FROM staging_refused_urls;
+        DELETE FROM staging_http_responses; DELETE FROM staging_robots; DELETE FROM crawl_queue;
+        DELETE FROM crawl_seen_urls; DELETE FROM crawl_domains; DELETE FROM crawl_robots;
+        DELETE FROM crawl_responses; DELETE FROM crawl_refused_urls; DELETE FROM crawl_links;",
+    )?;
+    tx.commit()
 }
 
 const SCHEMA: &str = r#"
@@ -173,10 +241,6 @@ CREATE TABLE IF NOT EXISTS staging_pages (
     published_at INTEGER,
     crawled_at INTEGER NOT NULL
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS staging_pages_fts USING fts5(title, description, text, content='staging_pages', content_rowid='id');
-CREATE TRIGGER IF NOT EXISTS staging_pages_ai AFTER INSERT ON staging_pages BEGIN
-  INSERT INTO staging_pages_fts(rowid, title, description, text) VALUES (new.id, new.title, new.description, new.text);
-END;
 CREATE TABLE IF NOT EXISTS staging_images (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     url TEXT NOT NULL UNIQUE,

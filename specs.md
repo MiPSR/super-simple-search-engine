@@ -1952,6 +1952,12 @@ Test or verify:
 
 Reasonable validation ranges must be implemented for configurable numeric values.
 
+Zero disables the maximum depth, extracted-text-size, and downloaded-body-size
+limits (unlimited). Zero worker/domain delay means no operator-imposed wait;
+website restrictions remain mandatory. Zero workers selects the automatic worker
+count, zero FIFO refill interval checks continuously, and zero automatic crawl
+interval disables scheduling. These special meanings must be documented in the UI.
+
 Do not add arbitrary maximum limits to the total crawl size, total indexed pages, or total number of domains.
 
 ---

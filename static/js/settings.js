@@ -1,130 +1,93 @@
-import { getPref, setPref } from './prefs.js';
-
-function colorBrand(text) {
-  const el = document.getElementById('brand');
-  el.innerHTML = '';
-  for (const ch of text) {
-    const span = document.createElement('span');
-    span.className = 'letter';
-    span.textContent = ch;
-    const hue = crypto.getRandomValues(new Uint32Array(1))[0] % 360;
-    span.style.color = `oklch(0.5 0.05 ${hue})`;
-    span.style.webkitTextStroke = `0.5px var(--text-color)`;
-    el.appendChild(span);
-  }
+import { getPref, setPref, applyTheme, applyBackground, saveBackground, colorBrand, api } from './prefs.js';
+colorBrand();
+const $ = id => document.getElementById(id);
+let loggedIn = false;
+function message(text) { $('message').textContent = text; }
+function authenticated(value) {
+  loggedIn = value; $('loginSection').hidden = value; $('adminSection').hidden = !value;
+  if (!value) $('password').value = '';
 }
-colorBrand('SSSE');
-
-// theme handling
-function applyTheme(t) {
-  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-  else delete document.documentElement.dataset.theme;
+async function action(work) {
+  try { await work(); } catch (error) { message(error.message); }
 }
-const themeSel = document.getElementById('theme');
-themeSel.value = getPref('theme', 'system');
-applyTheme(themeSel.value);
-themeSel.addEventListener('change', () => { setPref('theme', themeSel.value); applyTheme(themeSel.value); });
-
-// background
-const bgFile = document.getElementById('bgFile');
-const bgPreview = document.getElementById('bgPreview');
-bgFile.addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  const buf = await f.arrayBuffer();
-  // store in IndexedDB simple: use localStorage dataurl
-  const reader = new FileReader();
-  reader.onload = () => {
-    localStorage.setItem('bg', reader.result);
-    document.body.classList.add('has-bg');
-    document.body.style.backgroundImage = `url(${reader.result})`;
-    bgPreview.innerHTML = `<img src="${reader.result}" style="max-width:200px"><button id="rm">X</button>`;
-  };
-  reader.readAsDataURL(f);
-});
-const bg = localStorage.getItem('bg');
-if (bg) { document.body.classList.add('has-bg'); document.body.style.backgroundImage = `url(${bg})`; bgPreview.innerHTML = `<img src="${bg}" style="max-width:200px">`; }
-document.getElementById('removeBg').addEventListener('click', () => {
-  localStorage.removeItem('bg');
-  document.body.classList.remove('has-bg');
-  document.body.style.backgroundImage = '';
-  bgPreview.innerHTML = '';
-});
-
-// results per page
-const rppDiv = document.getElementById('rpp');
-for (const cat of ['PAGES','IMAGES','VIDEOS','NEWS']) {
-  const def = (cat==='IMAGES'||cat==='VIDEOS')?18:10;
-  const inp = document.createElement('input');
-  inp.type = 'number';
-  inp.value = getPref('rpp_'+cat, def);
-  inp.addEventListener('change', () => setPref('rpp_'+cat, inp.value));
-  const lbl = document.createElement('label');
-  lbl.textContent = cat + ' ';
-  lbl.appendChild(inp);
-  rppDiv.appendChild(lbl);
+$('theme').value = getPref('theme', 'system');
+$('theme').addEventListener('change', () => { setPref('theme', $('theme').value); applyTheme(); });
+async function showBackground() {
+  const url = await applyBackground(); $('bgPreview').replaceChildren();
+  if (url) { const image = document.createElement('img'); image.src = url; image.alt = 'Current custom background'; $('bgPreview').append(image); }
 }
-
-// login
-document.getElementById('loginForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const username = document.getElementById('username').value;
-  const password = document.getElementById('password').value;
-  const res = await fetch('/api/admin/login', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({username,password}) });
-  if (res.ok) {
-    document.getElementById('loginSection').style.display = 'none';
-    document.getElementById('adminSection').style.display = 'block';
-    loadSettings();
-  } else { alert('login failed'); }
-});
-
+$('bgFile').addEventListener('change', () => action(async () => {
+  const file = $('bgFile').files[0]; if (!file) return;
+  if (!file.type.startsWith('image/')) throw new Error('Select an image file.');
+  await saveBackground(file); await showBackground(); message('Background saved in this browser.');
+}));
+$('removeBg').addEventListener('click', () => action(async () => { await saveBackground(null); await showBackground(); $('bgFile').value = ''; }));
+showBackground();
+for (const category of ['PAGES', 'IMAGES', 'VIDEOS', 'NEWS']) {
+  const fallback = category === 'IMAGES' || category === 'VIDEOS' ? 18 : 10;
+  const label = document.createElement('label'); label.textContent = `${category} `;
+  const input = document.createElement('input'); input.type = 'number'; input.min = 1; input.max = 100; input.step = 1; input.value = getPref(`rpp_${category}`, fallback);
+  input.addEventListener('change', () => {
+    const n = Number(input.value);
+    if (!Number.isInteger(n) || n < 1 || n > 100) { input.value = fallback; message('Results per page must be 1–100.'); }
+    setPref(`rpp_${category}`, input.value);
+  }); label.append(input); $('rpp').append(label);
+}
+$('loginForm').addEventListener('submit', e => { e.preventDefault(); action(async () => {
+  await api('/api/admin/login', { method: 'POST', body: JSON.stringify({ username: $('username').value, password: $('password').value }) });
+  $('password').value = ''; message('Logged in.'); await loadSettings();
+}); });
+$('logout').addEventListener('click', () => action(async () => { await api('/api/admin/logout', { method: 'POST' }); authenticated(false); message('Logged out.'); }));
+const labels = {
+  crawl_interval_days: 'Automatic crawl interval (days; 0 = manual only)', worker_count: 'Workers (0 = automatic)',
+  worker_delay_ms: 'Worker delay (milliseconds)', domain_delay_ms: 'Domain delay (milliseconds)',
+  fifo_refill_ms: 'FIFO refill check (milliseconds)', max_depth: 'Maximum depth per domain (0 = unlimited)',
+  max_text_bytes: 'Maximum extracted text (bytes; 0 = unlimited)', max_html_bytes: 'Maximum response body (bytes; 0 = unlimited)'
+};
 async function loadSettings() {
-  const res = await fetch('/api/admin/settings');
-  const data = await res.json();
-  const form = document.getElementById('settingsForm');
-  form.innerHTML = '';
-  for (const [k,v] of Object.entries(data)) {
-    const lbl = document.createElement('label');
-    lbl.textContent = k;
-    const inp = document.createElement('input');
-    inp.value = v;
-    inp.name = k;
-    lbl.appendChild(inp);
-    form.appendChild(lbl);
-    form.appendChild(document.createElement('br'));
+  const data = await api('/api/admin/settings');
+  $('settingsForm').replaceChildren();
+  for (const [key, value] of Object.entries(data)) {
+    const label = document.createElement('label'); label.textContent = labels[key] || key;
+    const input = document.createElement('input'); input.type = 'number'; input.name = key; input.min = 0; input.step = 1; input.required = true; input.value = value;
+    label.append(input); $('settingsForm').append(label);
   }
-  const btn = document.createElement('button');
-  btn.textContent = 'Save Settings';
-  btn.type = 'button';
-  btn.addEventListener('click', saveSettings);
-  form.appendChild(btn);
-  // seeds
-  const sr = await fetch('/api/admin/seeds');
-  const seeds = await sr.json();
-  document.getElementById('seeds').value = seeds.join('\n');
+  const button = document.createElement('button'); button.textContent = 'Save Settings'; $('settingsForm').append(button);
+  const [seeds, filters] = await Promise.all([api('/api/admin/seeds'), api('/api/admin/filters')]);
+  $('seeds').value = seeds.join('\n'); $('bannedDomains').value = filters.banned_domains.join('\n');
+  $('bannedWords').value = filters.banned_words.map(w => `${w.mode}:${w.word}`).join('\n'); $('promoted').value = filters.promoted_domains.join('\n');
+  authenticated(true);
+  await refreshStatus();
 }
-
-async function saveSettings() {
-  const form = document.getElementById('settingsForm');
-  const inputs = form.querySelectorAll('input');
-  const obj = {};
-  inputs.forEach(i => { if (i.name) obj[i.name] = isNaN(i.value)? i.value : Number(i.value); });
-  await fetch('/api/admin/settings', { method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify(obj) });
-  alert('saved');
-}
-
-document.getElementById('saveSeeds').addEventListener('click', async () => {
-  const seeds = document.getElementById('seeds').value.split('\n').map(s=>s.trim()).filter(Boolean);
-  await fetch('/api/admin/seeds', { method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify({seeds}) });
-  alert('saved');
-});
-
+$('settingsForm').addEventListener('submit', e => { e.preventDefault(); action(async () => {
+  const settings = Object.fromEntries([...$('settingsForm').querySelectorAll('input')].map(i => [i.name, Number(i.value)]));
+  await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify(settings) }); message('Settings saved; apply to next crawl.');
+}); });
+function lines(id) { return $(id).value.split('\n').map(s => s.trim()).filter(Boolean); }
+for (const [button, path, payload] of [
+  ['saveSeeds', 'seeds', () => ({ seeds: lines('seeds') })],
+  ['saveDomains', 'banned-domains', () => ({ items: lines('bannedDomains') })],
+  ['savePromoted', 'promoted', () => ({ items: lines('promoted') })],
+  ['saveWords', 'banned-words', () => ({ items: lines('bannedWords').map(line => {
+    const colon = line.indexOf(':'); if (colon < 0) throw new Error('Prefix each term with whole: or substring:');
+    return { mode: line.slice(0, colon).trim(), word: line.slice(colon + 1).trim() };
+  }) })]
+]) $(button).addEventListener('click', () => action(async () => { await api(`/api/admin/${path}`, { method: 'PUT', body: JSON.stringify(payload()) }); message('Saved. Bans and seeds apply to the next crawl.'); }));
+$('passwordForm').addEventListener('submit', e => { e.preventDefault(); action(async () => {
+  await api('/api/admin/password', { method: 'POST', body: JSON.stringify({ username: $('pwUsername').value, old_password: $('oldPassword').value, new_password: $('newPassword').value }) });
+  $('passwordForm').reset(); authenticated(false); message('Password changed. All sessions invalidated.');
+}); });
 async function refreshStatus() {
-  const res = await fetch('/api/admin/crawl/status');
-  const data = await res.json();
-  document.getElementById('crawlStatus').textContent = JSON.stringify(data, null, 2);
+  if (!loggedIn) return;
+  try { $('crawlStatus').textContent = JSON.stringify(await api('/api/admin/crawl/status'), null, 2); }
+  catch (error) { authenticated(false); message(error.message); }
 }
-document.getElementById('crawlStart').addEventListener('click', async () => { await fetch('/api/admin/crawl/start', {method:'POST'}); refreshStatus(); });
-document.getElementById('crawlStop').addEventListener('click', async () => { await fetch('/api/admin/crawl/stop', {method:'POST'}); refreshStatus(); });
-document.getElementById('crawlRestart').addEventListener('click', async () => { await fetch('/api/admin/crawl/restart', {method:'POST'}); refreshStatus(); });
+for (const [id, command] of [['crawlStart', 'start'], ['crawlStop', 'stop'], ['crawlRestart', 'restart']]) {
+  $(id).addEventListener('click', () => action(async () => {
+    $(id).disabled = true;
+    try { await api(`/api/admin/crawl/${command}`, { method: 'POST' }); await refreshStatus(); message(`Crawl ${command} completed.`); }
+    finally { $(id).disabled = false; }
+  }));
+}
 setInterval(refreshStatus, 3000);
+loadSettings().catch(() => authenticated(false));

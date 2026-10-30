@@ -5,44 +5,64 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Settings - SSSE</title>
 <meta name="robots" content="noindex,nofollow">
+<script src="/js/theme.js"></script>
 <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
+<a href="#main" class="skip-link">Skip to content</a>
 <header class="header">
   <div class="brand" id="brand"></div>
   <nav class="topnav"><a href="/">Home</a></nav>
 </header>
-<main>
+<main id="main">
   <h1>Settings</h1>
+  <p id="message" role="status" aria-live="polite"></p>
+  <section aria-labelledby="browserHeading">
+    <h2 id="browserHeading">Browser Preferences</h2>
+    <label>Theme <select id="theme">
+      <option value="system">Follow System</option><option value="light">Light</option><option value="dark">Dark</option>
+    </select></label>
+    <label>Background image <input type="file" id="bgFile" accept="image/*"></label>
+    <button id="removeBg" aria-label="Remove background image">× Remove Background</button>
+    <div id="bgPreview"></div>
+    <fieldset id="rpp"><legend>Results per page (1–100)</legend></fieldset>
+  </section>
   <section id="loginSection">
     <h2>Login</h2>
     <form id="loginForm">
-      <input id="username" placeholder="username">
-      <input id="password" type="password" placeholder="password">
+      <label>Username <input id="username" autocomplete="username" value="admin" required></label>
+      <label>Password <input id="password" type="password" autocomplete="current-password" required></label>
       <button type="submit">Login</button>
     </form>
   </section>
-  <section id="adminSection" style="display:none">
+  <section id="adminSection" hidden>
+    <button id="logout">Log out</button>
     <h2>Server Settings</h2>
+    <p>Crawler settings, seeds and bans apply to the next crawl. Promotions apply to searches immediately.</p>
+    <p>Limits: 0 means unlimited. Delays: 0 means no extra wait. Workers: 0 selects the automatic worker count. Automatic crawl interval: 0 disables scheduling. FIFO refill: 0 checks continuously.</p>
     <form id="settingsForm"></form>
     <h2>Seed URLs</h2>
-    <textarea id="seeds"></textarea>
+    <label>HTTPS starting URLs, one per line <textarea id="seeds" rows="6"></textarea></label>
     <button id="saveSeeds">Save Seeds</button>
+    <h2>Content Controls</h2>
+    <label>Banned domains, one per line (includes subdomains)<textarea id="bannedDomains" rows="5"></textarea></label>
+    <button id="saveDomains">Save Banned Domains</button>
+    <label>Banned terms, one per line, prefixed with whole: or substring:<textarea id="bannedWords" rows="5" placeholder="whole:example&#10;substring:example"></textarea></label>
+    <button id="saveWords">Save Banned Terms</button>
+    <label>Promoted domains, one per line<textarea id="promoted" rows="5"></textarea></label>
+    <button id="savePromoted">Save Promoted Domains</button>
     <h2>Crawl Controls</h2>
     <button id="crawlStart">Start</button>
     <button id="crawlStop">Stop</button>
     <button id="crawlRestart">Restart</button>
     <pre id="crawlStatus"></pre>
-    <h2>Browser Preferences</h2>
-    <select id="theme">
-      <option value="system">Follow System</option>
-      <option value="light">Light</option>
-      <option value="dark">Dark</option>
-    </select>
-    <input type="file" id="bgFile" accept="image/*">
-    <div id="bgPreview"></div>
-    <button id="removeBg">Remove Background</button>
-    <div id="rpp"></div>
+    <h2>Change Administrator Password</h2>
+    <form id="passwordForm">
+      <label>Username <input id="pwUsername" autocomplete="username" value="admin" required></label>
+      <label>Current password <input id="oldPassword" type="password" autocomplete="current-password" required></label>
+      <label>New password <input id="newPassword" type="password" autocomplete="new-password" required maxlength="1024"></label>
+      <button>Change Password and Log Out All Sessions</button>
+    </form>
   </section>
 </main>
 <script type="module" src="/js/settings.js"></script>

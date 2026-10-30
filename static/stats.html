@@ -5,20 +5,27 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Stats - SSSE</title>
 <meta name="robots" content="noindex,nofollow">
+<script src="/js/theme.js"></script>
 <link rel="stylesheet" href="/css/style.css">
 <script src="/js/chart.js" defer></script>
 
 </head>
 <body>
+<a href="#main" class="skip-link">Skip to content</a>
 <header class="header">
   <div class="brand" id="brand"></div>
   <nav class="topnav"><a href="/">Home</a></nav>
 </header>
-<main>
+<main id="main">
   <h1>Statistics</h1>
   <section id="current"></section>
   <section id="popularity"></section>
-  <canvas id="chart"></canvas>
+  <fieldset id="series"><legend>Visible graph series</legend></fieldset>
+  <canvas id="chart" role="img" aria-label="Crawl statistics over time; numeric data follows below"></canvas>
+  <div class="table-scroll"><table><caption>Historical crawl statistics (also available without interacting with the graph)</caption>
+    <thead><tr><th scope="col">Completed</th><th scope="col">Pages</th><th scope="col">Domains</th><th scope="col">Images</th><th scope="col">Videos</th><th scope="col">News</th><th scope="col">Refused</th><th scope="col">Processed</th><th scope="col">Duration (ms)</th></tr></thead>
+    <tbody id="history"></tbody>
+  </table></div>
 </main>
 <script type="module" src="/js/stats.js"></script>
 </body>

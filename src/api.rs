@@ -1,17 +1,37 @@
 use crate::state::AppState;
 use axum::{
     extract::{Query, State},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, Uri},
     middleware::Next,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+type ApiResult = Result<Json<Value>, ApiError>;
+pub struct ApiError(StatusCode, String);
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        tracing::error!(error=%e, "API operation failed");
+        Self(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operation failed; see server logs".into(),
+        )
+    }
+}
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({"error":self.1}))).into_response()
+    }
+}
+fn invalid(message: impl ToString) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, message.to_string())
+}
 
 pub fn router(state: AppState) -> Router {
-    let st = Arc::new(state);
     let admin = Router::new()
         .route("/login", post(login))
         .route("/logout", post(logout))
@@ -32,26 +52,150 @@ pub fn router(state: AppState) -> Router {
         .route("/crawl/start", post(crawl_start))
         .route("/crawl/stop", post(crawl_stop))
         .route("/crawl/restart", post(crawl_restart))
-        .layer(axum::middleware::from_fn_with_state(st.clone(), auth_mw))
-        .with_state(st.clone());
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_mw));
     Router::new()
-        .route("/", get(serve_index))
-        .route("/robots.txt", get(robots_txt))
+        .route("/opensearch.xml", get(opensearch))
+        .route(
+            "/robots.txt",
+            get(|| async { "User-agent: *\nDisallow: /\n" }),
+        )
         .route("/api/search", get(search))
         .route("/api/stats", get(stats))
         .route("/api/stats/history", get(stats_history))
         .route("/api/stats/top", get(stats_top))
         .route("/api/stats/bottom", get(stats_bottom))
         .nest("/api/admin", admin)
-        .with_state(st.clone())
-        .fallback_service(tower_http::services::ServeDir::new("static"))
+        .fallback(get(asset))
+        .layer(axum::middleware::from_fn(security_headers))
+        .with_state(state)
 }
 
-async fn serve_index() -> impl IntoResponse {
-    let path = "static/index.html";
-    match std::fs::read_to_string(path) {
-        Ok(s) => (StatusCode::OK, [("content-type", "text/html")], s).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+async fn security_headers(req: Request<axum::body::Body>, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    for (name,value) in [("x-robots-tag","noindex, nofollow"),("x-content-type-options","nosniff"),
+        ("referrer-policy","no-referrer"),("x-frame-options","DENY"),
+        ("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src https: data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")] {
+        response.headers_mut().insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
+    }
+    response
+}
+
+async fn asset(uri: Uri) -> Response {
+    let (mime, data): (&str, &[u8]) = match uri.path() {
+        "/" => (
+            "text/html; charset=utf-8",
+            include_bytes!("../static/index.html"),
+        ),
+        "/settings.html" => (
+            "text/html; charset=utf-8",
+            include_bytes!("../static/settings.html"),
+        ),
+        "/stats.html" => (
+            "text/html; charset=utf-8",
+            include_bytes!("../static/stats.html"),
+        ),
+        "/css/style.css" => ("text/css", include_bytes!("../static/css/style.css")),
+        "/js/app.js" => ("text/javascript", include_bytes!("../static/js/app.js")),
+        "/js/settings.js" => (
+            "text/javascript",
+            include_bytes!("../static/js/settings.js"),
+        ),
+        "/js/prefs.js" => ("text/javascript", include_bytes!("../static/js/prefs.js")),
+        "/js/theme.js" => ("text/javascript", include_bytes!("../static/js/theme.js")),
+        "/js/stats.js" => ("text/javascript", include_bytes!("../static/js/stats.js")),
+        "/js/chart.js" => ("text/javascript", include_bytes!("../static/js/chart.js")),
+        "/js/chart.LICENSE.txt" => (
+            "text/plain; charset=utf-8",
+            include_bytes!("../static/js/chart.LICENSE.txt"),
+        ),
+        "/opensearch.xml" => (
+            "application/opensearchdescription+xml",
+            include_bytes!("../static/opensearch.xml"),
+        ),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([("content-type", mime)], data).into_response()
+}
+
+async fn opensearch(headers: axum::http::HeaderMap) -> Response {
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost:3000");
+    if host.parse::<axum::http::uri::Authority>().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let scheme = if std::env::var("SSSE_INSECURE_COOKIE").as_deref() == Ok("1") {
+        "http"
+    } else {
+        "https"
+    };
+    let origin = format!("{scheme}://{host}")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
+    let document = include_str!("../static/opensearch.xml")
+        .replace("template=\"/?q=", &format!("template=\"{origin}/?q="));
+    (
+        [("content-type", "application/opensearchdescription+xml")],
+        document,
+    )
+        .into_response()
+}
+
+#[derive(Default, Debug)]
+struct ParsedQuery {
+    positive: String,
+    negative: String,
+    site: String,
+}
+fn literal(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+fn parse_query(q: &str) -> ParsedQuery {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    for c in q.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if c.is_whitespace() && !quoted {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(c);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    let mut parsed = ParsedQuery::default();
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    for token in tokens {
+        if let Some(site) = token.strip_prefix("site:") {
+            parsed.site = site.trim_end_matches('.').to_lowercase();
+        } else if let Some(term) = token.strip_prefix('-').filter(|s| !s.is_empty()) {
+            negative.push(literal(term));
+        } else {
+            positive.push(literal(&token));
+        }
+    }
+    parsed.positive = positive.join(" AND ");
+    parsed.negative = negative.join(" OR ");
+    parsed
+}
+pub fn build_fts_query(q: &str) -> String {
+    let p = parse_query(q);
+    if p.negative.is_empty() {
+        p.positive
+    } else if p.positive.is_empty() {
+        String::new()
+    } else {
+        format!("{} NOT ({})", p.positive, p.negative)
     }
 }
 
@@ -62,760 +206,439 @@ struct SearchParams {
     page: Option<u32>,
     per_page: Option<u32>,
 }
-
-#[derive(Serialize)]
-struct SearchResult {
-    url: String,
-    title: Option<String>,
-    description: Option<String>,
-    domain: Option<String>,
-    published_at: Option<i64>,
-    extra: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct SearchResponse {
-    results: Vec<SearchResult>,
-    total: i64,
-    page: u32,
-    per_page: u32,
-}
-
-async fn search(
-    State(st): State<Arc<AppState>>,
-    Query(p): Query<SearchParams>,
-) -> impl IntoResponse {
-    let conn = st.db();
+async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> ApiResult {
     let q = p.q.unwrap_or_default();
-    let category = p
-        .category
-        .unwrap_or_else(|| "PAGES".to_string())
-        .to_uppercase();
+    if q.len() > 4096 {
+        return Err(invalid("query exceeds 4096 bytes"));
+    }
+    let category = p.category.unwrap_or_else(|| "PAGES".into()).to_uppercase();
+    let table = match category.as_str() {
+        "PAGES" => "pages",
+        "IMAGES" => "images",
+        "VIDEOS" => "videos",
+        "NEWS" => "news",
+        _ => return Err(invalid("unknown search category")),
+    };
     let page = p.page.unwrap_or(1).max(1);
-    let per_page = p.per_page.unwrap_or(10).max(1);
-    let offset = (page - 1) * per_page;
-
-    // Build FTS query safely: wrap terms. Simple approach: use the raw query but quote.
-    let fts_query = build_fts_query(&q);
-
-    let (results, total) = match category.as_str() {
-        "IMAGES" => query_images(&conn, &fts_query, &q, offset, per_page),
-        "VIDEOS" => query_videos(&conn, &fts_query, &q, offset, per_page),
-        "NEWS" => query_news(&conn, &fts_query, &q, offset, per_page),
-        _ => query_pages(&conn, &fts_query, &q, offset, per_page),
-    };
-
-    Json(SearchResponse {
-        results,
-        total,
-        page,
-        per_page,
-    })
-    .into_response()
-}
-
-pub fn build_fts_query(q: &str) -> String {
-    let q = q.trim();
-    if q.is_empty() {
-        return String::new();
-    }
-    // Parse simple operators
-    let mut parts: Vec<String> = Vec::new();
-    let mut site_filter: Option<String> = None;
-    // tokenize respecting quotes
-    let chars = q.chars().peekable();
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    for c in chars {
-        if c == '"' {
-            in_quote = !in_quote;
-            cur.push(c);
-        } else if c.is_whitespace() && !in_quote {
-            if !cur.trim().is_empty() {
-                tokens.push(cur.trim().to_string());
-            }
-            cur.clear();
+    let per_page = p
+        .per_page
+        .unwrap_or(if table == "images" || table == "videos" {
+            18
         } else {
-            cur.push(c);
-        }
+            10
+        });
+    if !(1..=100).contains(&per_page) {
+        return Err(invalid("per_page must be 1–100"));
     }
-    if !cur.trim().is_empty() {
-        tokens.push(cur.trim().to_string());
+    let offset = i64::from(page - 1) * i64::from(per_page);
+    let mut parsed = parse_query(&q);
+    if !parsed.site.is_empty() {
+        parsed.site = normalize_domain(&parsed.site).map_err(invalid)?;
     }
-
-    for t in tokens {
-        if let Some(site) = t.strip_prefix("site:") {
-            site_filter = Some(site.to_string());
-            continue;
-        }
-        if let Some(neg) = t.strip_prefix('-') {
-            if !neg.is_empty() {
-                parts.push(format!("NOT {}", neg));
-                continue;
-            }
-        }
-        parts.push(t);
+    if q.trim().is_empty() {
+        return Ok(Json(
+            json!({"results":[],"total":0,"page":page,"per_page":per_page}),
+        ));
     }
-    // store site filter in a thread-local? Instead, we rely on q passed separately.
-    let _ = site_filter;
-    parts.join(" ")
+    let data = st.database(move |conn| {
+        conn.create_scalar_function("host_matches", 2, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+            let url: String=ctx.get(0)?; let site: String=ctx.get(1)?;
+            Ok(url::Url::parse(&url).ok().and_then(|u| u.host_str().map(|h| h==site || h.ends_with(&format!(".{site}")))).unwrap_or(false))
+        })?;
+        let fts = format!("{table}_fts");
+        let filter = format!("(?1='' OR p.id IN (SELECT rowid FROM {fts} WHERE {fts} MATCH ?1))
+            AND (?2='' OR p.id NOT IN (SELECT rowid FROM {fts} WHERE {fts} MATCH ?2))
+            AND (?3='' OR host_matches(p.url,?3))");
+        let tx = conn.transaction()?;
+        let total: i64 = tx.query_row(&format!("SELECT count(*) FROM {table} p WHERE {filter}"), params![parsed.positive,parsed.negative,parsed.site], |r| r.get(0))?;
+        let desc = if table=="images" {"p.alt"} else {"p.description"};
+        let extra = if table=="videos" {"p.thumbnail_url"} else {"NULL"};
+        // Logarithmic popularity can break near-relevance ties without overwhelming BM25.
+        tx.create_scalar_function("popularity_boost",1,rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| Ok(1.0 + (ctx.get::<i64>(0)?.max(0) as f64).ln_1p().min(20.0)*0.01))?;
+        let sql = format!("SELECT p.url,p.title,{desc},p.domain,p.published_at,{extra}
+            FROM {table} p LEFT JOIN domains d ON d.registrable=p.domain WHERE {filter}
+            ORDER BY EXISTS(SELECT 1 FROM promoted_domains pr WHERE pr.domain=p.domain) DESC,
+            (CASE WHEN ?1='' THEN 0 ELSE (SELECT bm25({fts},5.0,2.0,1.0) FROM {fts} WHERE rowid=p.id AND {fts} MATCH ?1) END)*popularity_boost(COALESCE(d.popularity,0)),p.url
+            LIMIT ?4 OFFSET ?5");
+        let mut stmt=tx.prepare(&sql)?;
+        let results=stmt.query_map(params![parsed.positive,parsed.negative,parsed.site,per_page,offset], |r| Ok(json!({
+            "url":r.get::<_,String>(0)?,"title":r.get::<_,Option<String>>(1)?,"description":r.get::<_,Option<String>>(2)?,
+            "domain":r.get::<_,Option<String>>(3)?,"published_at":r.get::<_,Option<i64>>(4)?,"extra":{"thumbnail":r.get::<_,Option<String>>(5)?}
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt); tx.commit()?;
+        Ok(json!({"results":results,"total":total,"page":page,"per_page":per_page}))
+    }).await?;
+    Ok(Json(data))
 }
 
-fn query_pages(
-    conn: &rusqlite::Connection,
-    fts: &str,
-    q: &str,
-    offset: u32,
-    per_page: u32,
-) -> (Vec<SearchResult>, i64) {
-    // promoted domains
-    let promoted: Vec<String> = conn
-        .prepare("SELECT domain FROM promoted_domains")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    let mut results = vec![];
-    let total: i64 = if fts.is_empty() {
-        conn.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))
-            .unwrap_or(0)
+async fn stats(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(st.database(|conn| {
+        let tx=conn.transaction()?;
+        let snapshot = tx.query_row("SELECT completed_at,duration_ms,domains,pages,images,videos,news,refused,processed,details FROM crawl_history ORDER BY id DESC LIMIT 1", [], history_row).optional()?.unwrap_or_else(|| json!({"pages":0,"domains":0,"images":0,"videos":0,"news":0,"refused":0,"processed":0,"last_success":null,"last_duration_ms":null}));
+        let mut result=snapshot;
+        result["last_success"]=result["completed_at"].clone(); result["last_duration_ms"]=result["duration_ms"].clone();
+        let mut stmt=tx.prepare("SELECT status,count(*) FROM http_responses GROUP BY status ORDER BY status")?;
+        result["http_statuses"]=Value::Array(stmt.query_map([],|r| Ok(json!({"status":r.get::<_,Option<i64>>(0)?,"count":r.get::<_,i64>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        drop(stmt);tx.commit()?;
+        Ok(result)
+    }).await?))
+}
+fn history_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let details =
+        serde_json::from_str::<Value>(&r.get::<_, String>(9)?).unwrap_or_else(|_| json!({}));
+    let mut row = json!({"completed_at":r.get::<_,i64>(0)?,"duration_ms":r.get::<_,i64>(1)?,"domains":r.get::<_,i64>(2)?,"pages":r.get::<_,i64>(3)?,"images":r.get::<_,i64>(4)?,"videos":r.get::<_,i64>(5)?,"news":r.get::<_,i64>(6)?,"refused":r.get::<_,i64>(7)?,"processed":r.get::<_,i64>(8)?});
+    if let Some(details) = details.as_object() {
+        for (key, value) in details {
+            row[key] = value.clone();
+        }
+    }
+    Ok(row)
+}
+async fn stats_history(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(st.database(|conn| { let mut stmt=conn.prepare("SELECT completed_at,duration_ms,domains,pages,images,videos,news,refused,processed,details FROM crawl_history ORDER BY id")?;
+        let rows=stmt.query_map([],history_row)?.collect::<rusqlite::Result<Vec<_>>>()?; Ok(json!(rows)) }).await?))
+}
+async fn popularity(st: AppState, descending: bool) -> ApiResult {
+    Ok(Json(st.database(move |conn| { let mut stmt=conn.prepare(&format!("SELECT registrable,popularity FROM domains d WHERE EXISTS(SELECT 1 FROM pages p WHERE p.domain=d.registrable) ORDER BY popularity {},registrable LIMIT 10",if descending {"DESC"} else {"ASC"}))?;
+        let rows=stmt.query_map([], |r| Ok(json!({"domain":r.get::<_,String>(0)?,"popularity":r.get::<_,i64>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?; Ok(json!(rows)) }).await?))
+}
+async fn stats_top(State(st): State<AppState>) -> ApiResult {
+    popularity(st, true).await
+}
+async fn stats_bottom(State(st): State<AppState>) -> ApiResult {
+    popularity(st, false).await
+}
+
+fn session(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("cookie")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|c| c.trim().strip_prefix("session=").map(str::to_owned))
+}
+fn cookie(token: &str, clear: bool) -> String {
+    let secure = if std::env::var("SSSE_INSECURE_COOKIE").as_deref() == Ok("1") {
+        ""
     } else {
-        // count
-        conn.query_row("SELECT COUNT(*) FROM pages p JOIN pages_fts f ON f.rowid=p.id WHERE pages_fts MATCH ?1", rusqlite::params![fts], |r| r.get(0)).unwrap_or(0)
+        "; Secure"
     };
-    if fts.is_empty() {
-        return (results, total);
-    }
-    // promoted first
-    for dom in &promoted {
-        let mut stmt = conn.prepare("SELECT p.url,p.title,p.description,p.domain,p.published_at FROM pages p JOIN pages_fts f ON f.rowid=p.id WHERE pages_fts MATCH ?1 AND p.domain=?2 LIMIT ?3").unwrap();
-        let rows = stmt
-            .query_map(rusqlite::params![fts, dom, per_page], |r| {
-                Ok(SearchResult {
-                    url: r.get(0)?,
-                    title: r.get(1)?,
-                    description: r.get(2)?,
-                    domain: r.get(3)?,
-                    published_at: r.get(4)?,
-                    extra: None,
-                })
-            })
-            .unwrap();
-        for x in rows.flatten() {
-            results.push(x);
-        }
-    }
-    let site_filter = q
-        .split_whitespace()
-        .find_map(|t| t.strip_prefix("site:").map(|s| s.to_string()));
-    if let Some(sf) = site_filter {
-        let mut stmt = conn.prepare("SELECT p.url,p.title,p.description,p.domain,p.published_at FROM pages p JOIN pages_fts f ON f.rowid=p.id WHERE pages_fts MATCH ?1 AND p.domain=?2 ORDER BY bm25(pages_fts) LIMIT ?3 OFFSET ?4").unwrap();
-        let rows = stmt
-            .query_map(rusqlite::params![fts, sf, per_page, offset], |r| {
-                Ok(SearchResult {
-                    url: r.get(0)?,
-                    title: r.get(1)?,
-                    description: r.get(2)?,
-                    domain: r.get(3)?,
-                    published_at: r.get(4)?,
-                    extra: None,
-                })
-            })
-            .unwrap();
-        for x in rows.flatten() {
-            results.push(x);
-        }
-    } else {
-        let mut stmt = conn.prepare("SELECT p.url,p.title,p.description,p.domain,p.published_at FROM pages p JOIN pages_fts f ON f.rowid=p.id WHERE pages_fts MATCH ?1 ORDER BY bm25(pages_fts) LIMIT ?2 OFFSET ?3").unwrap();
-        let rows = stmt
-            .query_map(rusqlite::params![fts, per_page, offset], |r| {
-                Ok(SearchResult {
-                    url: r.get(0)?,
-                    title: r.get(1)?,
-                    description: r.get(2)?,
-                    domain: r.get(3)?,
-                    published_at: r.get(4)?,
-                    extra: None,
-                })
-            })
-            .unwrap();
-        for x in rows.flatten() {
-            results.push(x);
-        }
-    }
-    // dedup promoted duplicates? skip for simplicity
-    (results, total)
+    format!(
+        "session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        if clear { 0 } else { 86400 },
+        secure
+    )
 }
-
-fn query_images(
-    conn: &rusqlite::Connection,
-    _fts: &str,
-    _q: &str,
-    offset: u32,
-    per_page: u32,
-) -> (Vec<SearchResult>, i64) {
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
-        .unwrap_or(0);
-    let mut stmt = conn
-        .prepare("SELECT url,title,alt,domain,published_at FROM images LIMIT ?1 OFFSET ?2")
-        .unwrap();
-    let rows = stmt
-        .query_map(rusqlite::params![per_page, offset], |r| {
-            Ok(SearchResult {
-                url: r.get(0)?,
-                title: r.get(1)?,
-                description: r.get(2)?,
-                domain: r.get(3)?,
-                published_at: r.get(4)?,
-                extra: None,
-            })
-        })
-        .unwrap();
-    let mut v = vec![];
-    for x in rows.flatten() {
-        v.push(x);
-    }
-    (v, total)
-}
-
-fn query_videos(
-    conn: &rusqlite::Connection,
-    _fts: &str,
-    _q: &str,
-    offset: u32,
-    per_page: u32,
-) -> (Vec<SearchResult>, i64) {
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))
-        .unwrap_or(0);
-    let mut stmt = conn
-        .prepare(
-            "SELECT url,title,domain,thumbnail_url,published_at FROM videos LIMIT ?1 OFFSET ?2",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map(rusqlite::params![per_page, offset], |r| {
-            Ok(SearchResult {
-                url: r.get(0)?,
-                title: r.get(1)?,
-                description: None,
-                domain: r.get(2)?,
-                published_at: r.get(4)?,
-                extra: Some(serde_json::json!({"thumbnail": r.get::<_,Option<String>>(3)?})),
-            })
-        })
-        .unwrap();
-    let mut v = vec![];
-    for x in rows.flatten() {
-        v.push(x);
-    }
-    (v, total)
-}
-
-fn query_news(
-    conn: &rusqlite::Connection,
-    _fts: &str,
-    _q: &str,
-    offset: u32,
-    per_page: u32,
-) -> (Vec<SearchResult>, i64) {
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM news", [], |r| r.get(0))
-        .unwrap_or(0);
-    let mut stmt = conn
-        .prepare("SELECT url,title,domain,published_at,description FROM news LIMIT ?1 OFFSET ?2")
-        .unwrap();
-    let rows = stmt
-        .query_map(rusqlite::params![per_page, offset], |r| {
-            Ok(SearchResult {
-                url: r.get(0)?,
-                title: r.get(1)?,
-                description: r.get(4)?,
-                domain: r.get(2)?,
-                published_at: r.get(3)?,
-                extra: None,
-            })
-        })
-        .unwrap();
-    let mut v = vec![];
-    for x in rows.flatten() {
-        v.push(x);
-    }
-    (v, total)
-}
-
-async fn stats(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let pages: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))
-        .unwrap_or(0);
-    let domains: i64 = conn
-        .query_row("SELECT COUNT(*) FROM domains", [], |r| r.get(0))
-        .unwrap_or(0);
-    let images: i64 = conn
-        .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
-        .unwrap_or(0);
-    let videos: i64 = conn
-        .query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))
-        .unwrap_or(0);
-    let news: i64 = conn
-        .query_row("SELECT COUNT(*) FROM news", [], |r| r.get(0))
-        .unwrap_or(0);
-    let refused: i64 = conn
-        .query_row("SELECT COUNT(*) FROM refused_urls", [], |r| r.get(0))
-        .unwrap_or(0);
-    let g = st.inner.lock().unwrap();
-    Json(serde_json::json!({
-        "pages": pages, "domains": domains, "images": images, "videos": videos,
-        "news": news, "refused": refused, "processed": g.processed,
-        "last_success": g.last_success, "last_duration_ms": g.last_duration_ms
-    }))
-}
-
-async fn stats_history(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let mut stmt = conn.prepare("SELECT completed_at,duration_ms,domains,pages,images,videos,news,refused,processed FROM crawl_history ORDER BY completed_at").unwrap();
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(serde_json::json!({
-                "completed_at": r.get::<_,i64>(0)?,
-                "duration_ms": r.get::<_,i64>(1)?,
-                "domains": r.get::<_,i64>(2)?,
-                "pages": r.get::<_,i64>(3)?,
-                "images": r.get::<_,i64>(4)?,
-                "videos": r.get::<_,i64>(5)?,
-                "news": r.get::<_,i64>(6)?,
-                "refused": r.get::<_,i64>(7)?,
-                "processed": r.get::<_,i64>(8)?,
-            }))
-        })
-        .unwrap();
-    let mut v = vec![];
-    for x in rows.flatten() {
-        v.push(x);
-    }
-    Json(v)
-}
-
-async fn stats_top(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let mut stmt = conn
-        .prepare("SELECT registrable,popularity FROM domains ORDER BY popularity DESC LIMIT 10")
-        .unwrap();
-    let rows = stmt.query_map([], |r| Ok(serde_json::json!({"domain": r.get::<_,String>(0)?, "popularity": r.get::<_,i64>(1)?}))).unwrap();
-    let mut v = vec![];
-    for x in rows.flatten() {
-        v.push(x);
-    }
-    Json(v)
-}
-
-async fn stats_bottom(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let mut stmt = conn
-        .prepare("SELECT registrable,popularity FROM domains ORDER BY popularity ASC LIMIT 10")
-        .unwrap();
-    let rows = stmt.query_map([], |r| Ok(serde_json::json!({"domain": r.get::<_,String>(0)?, "popularity": r.get::<_,i64>(1)?}))).unwrap();
-    let mut v = vec![];
-    for x in rows.flatten() {
-        v.push(x);
-    }
-    Json(v)
-}
-
 #[derive(Deserialize)]
 struct LoginReq {
     username: String,
     password: String,
 }
-
-async fn login(State(st): State<Arc<AppState>>, Json(req): Json<LoginReq>) -> impl IntoResponse {
-    let conn = st.db();
-    if crate::auth::check_login(&conn, &req.username, &req.password) {
-        let token = crate::auth::create_session(&conn, &req.username);
-        // set cookie
-        let cookie = format!("session={}; HttpOnly; SameSite=Lax; Path=/", token);
-        (
-            StatusCode::OK,
-            [("set-cookie", cookie)],
-            Json(serde_json::json!({"ok": true})),
+async fn login(
+    State(st): State<AppState>,
+    Json(req): Json<LoginReq>,
+) -> Result<Response, ApiError> {
+    if req.password.len() > 1024 || req.username.len() > 128 {
+        return Err(invalid("credentials too long"));
+    }
+    let token = st
+        .database(move |conn| {
+            if !crate::auth::check_login(conn, &req.username, &req.password) {
+                return Ok(None);
+            }
+            Ok(Some(crate::auth::create_session(conn, &req.username)?))
+        })
+        .await?;
+    match token {
+        Some(t) => Ok((
+            [("set-cookie", cookie(&t, false))],
+            Json(json!({"ok":true})),
         )
-            .into_response()
-    } else {
-        (
+            .into_response()),
+        None => Err(ApiError(
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error":"invalid"})),
-        )
-            .into_response()
+            "invalid credentials".into(),
+        )),
     }
 }
-
-async fn logout(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+async fn logout(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(token) = session(&headers) {
+        st.database(move |conn| {
+            conn.execute("DELETE FROM sessions WHERE token=?1", [token])?;
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(([("set-cookie", cookie("", true))], Json(json!({"ok":true}))).into_response())
 }
-
 #[derive(Deserialize)]
 struct PwReq {
     username: String,
     old_password: String,
     new_password: String,
 }
-
-async fn change_password(
-    State(st): State<Arc<AppState>>,
-    Json(req): Json<PwReq>,
-) -> impl IntoResponse {
-    let conn = st.db();
-    if !crate::auth::check_login(&conn, &req.username, &req.old_password) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error":"invalid"})),
-        )
-            .into_response();
+async fn change_password(State(st): State<AppState>, Json(req): Json<PwReq>) -> ApiResult {
+    if req.new_password.is_empty() || req.new_password.len() > 1024 || req.old_password.len() > 1024
+    {
+        return Err(invalid("password must contain 1–1024 bytes"));
     }
-    crate::auth::set_password(&conn, &req.username, &req.new_password);
-    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-}
-
-async fn get_settings(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let g = st.inner.lock().unwrap();
-    Json(serde_json::json!({
-        "worker_count": g.settings.worker_count,
-        "worker_delay_ms": g.settings.worker_delay_ms,
-        "domain_delay_ms": g.settings.domain_delay_ms,
-        "max_depth": g.settings.max_depth,
-        "max_text_bytes": g.settings.max_text_bytes,
-        "max_html_bytes": g.settings.max_html_bytes,
-    }))
-}
-
-#[derive(Deserialize)]
-struct SettingsUpdate {
-    worker_count: Option<usize>,
-    worker_delay_ms: Option<i64>,
-    domain_delay_ms: Option<i64>,
-    max_depth: Option<i64>,
-    max_text_bytes: Option<i64>,
-    max_html_bytes: Option<i64>,
-}
-
-async fn update_settings(
-    State(st): State<Arc<AppState>>,
-    Json(u): Json<SettingsUpdate>,
-) -> impl IntoResponse {
-    let mut g = st.inner.lock().unwrap();
-    if let Some(v) = u.worker_count {
-        g.settings.worker_count = v;
-        crate::settings::set(&st.db(), "worker_count", &v.to_string());
-    }
-    if let Some(v) = u.worker_delay_ms {
-        g.settings.worker_delay_ms = v;
-        crate::settings::set(&st.db(), "worker_delay_ms", &v.to_string());
-    }
-    if let Some(v) = u.domain_delay_ms {
-        g.settings.domain_delay_ms = v;
-        crate::settings::set(&st.db(), "domain_delay_ms", &v.to_string());
-    }
-    if let Some(v) = u.max_depth {
-        g.settings.max_depth = v;
-        crate::settings::set(&st.db(), "max_depth", &v.to_string());
-    }
-    if let Some(v) = u.max_text_bytes {
-        g.settings.max_text_bytes = v;
-        crate::settings::set(&st.db(), "max_text_bytes", &v.to_string());
-    }
-    if let Some(v) = u.max_html_bytes {
-        g.settings.max_html_bytes = v;
-        crate::settings::set(&st.db(), "max_html_bytes", &v.to_string());
-    }
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-}
-
-async fn get_seeds(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let seeds: Vec<String> = conn
-        .prepare("SELECT url FROM seed_urls")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    Json(seeds)
-}
-
-#[derive(Deserialize)]
-struct SeedsUpdate {
-    seeds: Vec<String>,
-}
-
-async fn update_seeds(
-    State(st): State<Arc<AppState>>,
-    Json(u): Json<SeedsUpdate>,
-) -> impl IntoResponse {
-    let conn = st.db();
-    conn.execute("DELETE FROM seed_urls", []).ok();
-    for s in u.seeds {
-        conn.execute(
-            "INSERT OR IGNORE INTO seed_urls(url) VALUES(?1)",
-            rusqlite::params![s],
-        )
-        .ok();
-    }
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-}
-
-async fn get_filters(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let banned_domains: Vec<String> = conn
-        .prepare("SELECT domain FROM banned_domains")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    let banned_words: Vec<serde_json::Value> = conn
-        .prepare("SELECT word,mode FROM banned_words")
-        .unwrap()
-        .query_map([], |r| {
-            Ok(serde_json::json!({"word": r.get::<_,String>(0)?, "mode": r.get::<_,String>(1)?}))
+    let changed = st
+        .database(move |conn| {
+            if !crate::auth::check_login(conn, &req.username, &req.old_password) {
+                return Ok(false);
+            }
+            crate::auth::set_password(conn, &req.username, &req.new_password)?;
+            Ok(true)
         })
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    let promoted: Vec<String> = conn
-        .prepare("SELECT domain FROM promoted_domains")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    Json(
-        serde_json::json!({"banned_domains": banned_domains, "banned_words": banned_words, "promoted_domains": promoted}),
-    )
-}
-
-async fn crawl_status(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let g = st.inner.lock().unwrap();
-    Json(serde_json::json!({
-        "running": g.crawl_running,
-        "processed": g.processed,
-        "refused": g.refused,
-        "start": g.crawl_start,
-    }))
-}
-
-async fn crawl_start(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    if st.inner.lock().unwrap().crawl_running {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"running"})),
-        )
-            .into_response();
+        .await?;
+    if !changed {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid credentials".into(),
+        ));
     }
-    st.inner.lock().unwrap().crawl_running = true;
-    st.inner.lock().unwrap().crawl_start = Some(chrono::Utc::now().timestamp());
-    let s = (*st).clone();
-    tokio::spawn(async move {
-        crate::crawler::run(s).await;
-    });
-    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+    Ok(Json(json!({"ok":true})))
 }
-
-async fn crawl_stop(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    st.inner.lock().unwrap().crawl_running = false;
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-}
-
-async fn crawl_restart(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    st.inner.lock().unwrap().crawl_running = false;
-    let conn = st.db();
-    let _ = conn.execute_batch(
-        "DELETE FROM staging_pages; DELETE FROM crawl_queue; DELETE FROM crawl_seen_urls;",
-    );
-    st.inner.lock().unwrap().crawl_running = true;
-    st.inner.lock().unwrap().crawl_start = Some(chrono::Utc::now().timestamp());
-    let s = (*st).clone();
-    tokio::spawn(async move {
-        crate::crawler::run(s).await;
-    });
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-}
-
 async fn auth_mw(
-    State(st): State<Arc<AppState>>,
+    State(st): State<AppState>,
     req: Request<axum::body::Body>,
     next: Next,
-) -> impl IntoResponse {
-    let path = req.uri().path().to_string();
-    if path.ends_with("/login") {
-        return next.run(req).await;
-    }
-    // CSRF: for state-changing methods, require matching Origin/Referer
-    let method = req.method().clone();
-    if method == axum::http::Method::POST
-        || method == axum::http::Method::PUT
-        || method == axum::http::Method::DELETE
-        || method == axum::http::Method::PATCH
-    {
+) -> Response {
+    if !matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) {
         let host = req
             .headers()
-            .get(axum::http::header::HOST)
+            .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let origin = req
+        let source = req
             .headers()
             .get("origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let referer = req
-            .headers()
-            .get("referer")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let ok = (origin.is_empty() || origin.contains(host))
-            && (referer.is_empty() || referer.contains(host));
-        // require at least one of origin/referer for browser requests; allow CLI (no origin) only if no cookie? We'll allow missing both for non-browser clients.
-        let has_browser_signal = !origin.is_empty() || !referer.is_empty();
-        if has_browser_signal && !ok {
-            return (
+            .or_else(|| req.headers().get("referer"))
+            .and_then(|v| v.to_str().ok());
+        // Cookie-authenticated mutations must carry an exact same-origin browser signal.
+        // Header-less local automation uses the Unix socket, not a CSRF exception.
+        let valid = source
+            .and_then(|s| url::Url::parse(s).ok())
+            .is_some_and(|u| {
+                matches!(u.scheme(), "http" | "https")
+                    && u[url::Position::BeforeHost..url::Position::AfterPort] == *host
+            });
+        if !valid {
+            return ApiError(
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error":"csrf"})),
+                "same-origin Origin or Referer required".into(),
             )
-                .into_response();
+            .into_response();
         }
     }
-    let cookie = req
-        .headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let token = cookie.split(';').find_map(|p| {
-        let p = p.trim();
-        p.strip_prefix("session=").map(|t| t.to_string())
-    });
-    let ok = match token {
-        Some(t) => crate::auth::validate_session(&st.db(), &t),
-        None => false,
-    };
-    if !ok {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error":"unauthorized"})),
-        )
-            .into_response();
+    if !req.uri().path().ends_with("/login") {
+        let token = session(req.headers());
+        let ok = st
+            .database(
+                move |conn| Ok(token.is_some_and(|t| crate::auth::validate_session(conn, &t))),
+            )
+            .await;
+        if !matches!(ok, Ok(true)) {
+            return ApiError(StatusCode::UNAUTHORIZED, "authentication required".into())
+                .into_response();
+        }
     }
     next.run(req).await
 }
 
-async fn get_banned_domains(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let v: Vec<String> = conn
-        .prepare("SELECT domain FROM banned_domains")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    Json(v)
+async fn get_settings(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(
+        serde_json::to_value(&st.inner.lock().unwrap().settings).map_err(anyhow::Error::from)?,
+    ))
 }
-
+async fn update_settings(State(st): State<AppState>, Json(value): Json<Value>) -> ApiResult {
+    let mut merged =
+        serde_json::to_value(&st.inner.lock().unwrap().settings).map_err(anyhow::Error::from)?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid("expected settings object"))?;
+    for (key, value) in obj {
+        if merged.get(key).is_none() {
+            return Err(invalid(format!("unknown setting: {key}")));
+        }
+        merged[key] = value.clone();
+    }
+    let settings: crate::settings::Settings = serde_json::from_value(merged).map_err(invalid)?;
+    settings.validate().map_err(invalid)?;
+    let saved = settings.clone();
+    st.database(move |conn| crate::settings::save(conn, &saved))
+        .await?;
+    st.inner.lock().unwrap().settings = settings;
+    Ok(Json(json!({"ok":true,"applies":"next crawl"})))
+}
+pub fn normalize_domain(value: &str) -> anyhow::Result<String> {
+    let s = value.trim().trim_end_matches('.');
+    anyhow::ensure!(
+        !s.is_empty()
+            && !s.contains(['/', ':', '@', '?', '#', '*'])
+            && !s.chars().any(char::is_whitespace),
+        "invalid domain"
+    );
+    let u = url::Url::parse(&format!("https://{s}/"))?;
+    anyhow::ensure!(
+        matches!(u.host(), Some(url::Host::Domain(_))),
+        "domain must be a hostname"
+    );
+    Ok(u.host_str().unwrap().to_owned())
+}
+async fn read_list(st: AppState, table: &'static str, column: &'static str) -> ApiResult {
+    Ok(Json(
+        st.database(move |conn| {
+            let mut stmt =
+                conn.prepare(&format!("SELECT {column} FROM {table} ORDER BY {column}"))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(json!(rows))
+        })
+        .await?,
+    ))
+}
+async fn replace_list(
+    st: AppState,
+    table: &'static str,
+    column: &'static str,
+    items: Vec<String>,
+) -> ApiResult {
+    st.database(move |conn| {
+        let tx = conn.transaction()?;
+        tx.execute(&format!("DELETE FROM {table}"), [])?;
+        for item in items {
+            tx.execute(
+                &format!("INSERT OR IGNORE INTO {table}({column}) VALUES(?1)"),
+                [item],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn get_seeds(State(st): State<AppState>) -> ApiResult {
+    read_list(st, "seed_urls", "url").await
+}
+#[derive(Deserialize)]
+struct SeedsUpdate {
+    seeds: Vec<String>,
+}
+async fn update_seeds(State(st): State<AppState>, Json(u): Json<SeedsUpdate>) -> ApiResult {
+    let mut urls = Vec::new();
+    for s in u.seeds {
+        let s = crate::crawler::normalize_url(s.trim())
+            .filter(|s| crate::crawler::is_valid_https_url_pub(s))
+            .ok_or_else(|| invalid("seeds must be HTTPS hostname URLs without credentials"))?;
+        urls.push(s);
+    }
+    replace_list(st, "seed_urls", "url", urls).await
+}
 #[derive(Deserialize)]
 struct StrList {
     items: Vec<String>,
 }
-
-async fn update_banned_domains(
-    State(st): State<Arc<AppState>>,
-    Json(u): Json<StrList>,
-) -> impl IntoResponse {
-    let conn = st.db();
-    conn.execute("DELETE FROM banned_domains", []).ok();
-    for s in u.items {
-        conn.execute(
-            "INSERT OR IGNORE INTO banned_domains(domain) VALUES(?1)",
-            rusqlite::params![s],
-        )
-        .ok();
-    }
-    (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+async fn get_banned_domains(State(st): State<AppState>) -> ApiResult {
+    read_list(st, "banned_domains", "domain").await
 }
-
-async fn get_banned_words(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let v: Vec<serde_json::Value> = conn
-        .prepare("SELECT word,mode FROM banned_words")
-        .unwrap()
-        .query_map([], |r| {
-            Ok(serde_json::json!({"word": r.get::<_,String>(0)?, "mode": r.get::<_,String>(1)?}))
+async fn update_banned_domains(State(st): State<AppState>, Json(u): Json<StrList>) -> ApiResult {
+    let items = u
+        .items
+        .iter()
+        .map(|s| normalize_domain(s))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(invalid)?;
+    replace_list(st, "banned_domains", "domain", items).await
+}
+async fn get_promoted(State(st): State<AppState>) -> ApiResult {
+    read_list(st, "promoted_domains", "domain").await
+}
+async fn update_promoted(State(st): State<AppState>, Json(u): Json<StrList>) -> ApiResult {
+    let mut items = Vec::new();
+    for s in u.items {
+        let domain = normalize_domain(&s).map_err(invalid)?;
+        items.push(psl::domain_str(&domain).unwrap_or(&domain).to_owned());
+    }
+    replace_list(st, "promoted_domains", "domain", items).await
+}
+async fn get_banned_words(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(
+        st.database(|conn| {
+            let mut stmt = conn.prepare("SELECT word,mode FROM banned_words ORDER BY word")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(json!({"word":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?}))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(json!(rows))
         })
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    Json(v)
+        .await?,
+    ))
 }
-
 #[derive(Deserialize)]
-struct BannedWordItem {
+struct WordItem {
     word: String,
-    mode: Option<String>,
+    mode: String,
 }
 #[derive(Deserialize)]
-struct BannedWordList {
-    items: Vec<BannedWordItem>,
+struct WordList {
+    items: Vec<WordItem>,
 }
-
-async fn update_banned_words(
-    State(st): State<Arc<AppState>>,
-    Json(u): Json<BannedWordList>,
-) -> impl IntoResponse {
-    let conn = st.db();
-    conn.execute("DELETE FROM banned_words", []).ok();
-    for it in u.items {
-        let mode = it.mode.unwrap_or_else(|| "whole".to_string());
-        conn.execute(
-            "INSERT OR IGNORE INTO banned_words(word,mode) VALUES(?1,?2)",
-            rusqlite::params![it.word, mode],
-        )
-        .ok();
+async fn update_banned_words(State(st): State<AppState>, Json(u): Json<WordList>) -> ApiResult {
+    if u.items
+        .iter()
+        .any(|i| i.word.trim().is_empty() || !matches!(i.mode.as_str(), "whole" | "substring"))
+    {
+        return Err(invalid(
+            "words must be nonempty; mode must be whole or substring",
+        ));
     }
-    (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+    st.database(move |conn| {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM banned_words", [])?;
+        for i in u.items {
+            tx.execute(
+                "INSERT OR IGNORE INTO banned_words(word,mode) VALUES(?1,?2)",
+                params![i.word.trim(), i.mode],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok":true})))
 }
-
-async fn get_promoted(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let conn = st.db();
-    let v: Vec<String> = conn
-        .prepare("SELECT domain FROM promoted_domains")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    Json(v)
+async fn get_filters(State(st): State<AppState>) -> ApiResult {
+    let domains = get_banned_domains(State(st.clone())).await?.0;
+    let words = get_banned_words(State(st.clone())).await?.0;
+    let promoted = get_promoted(State(st)).await?.0;
+    Ok(Json(
+        json!({"banned_domains":domains,"banned_words":words,"promoted_domains":promoted}),
+    ))
 }
-
-async fn update_promoted(
-    State(st): State<Arc<AppState>>,
-    Json(u): Json<StrList>,
-) -> impl IntoResponse {
-    let conn = st.db();
-    conn.execute("DELETE FROM promoted_domains", []).ok();
-    for s in u.items {
-        conn.execute(
-            "INSERT OR IGNORE INTO promoted_domains(domain) VALUES(?1)",
-            rusqlite::params![s],
-        )
-        .ok();
-    }
-    (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+async fn crawl_status(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(st.crawl_status().await?))
 }
-
-async fn robots_txt() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain")],
-        "User-agent: *\nDisallow: /\n",
-    )
+async fn crawl_start(State(st): State<AppState>) -> ApiResult {
+    st.start_crawl(false)
+        .await
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn crawl_stop(State(st): State<AppState>) -> ApiResult {
+    st.stop_crawl().await?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn crawl_restart(State(st): State<AppState>) -> ApiResult {
+    st.start_crawl(true).await?;
+    Ok(Json(json!({"ok":true})))
 }
