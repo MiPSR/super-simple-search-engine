@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::info;
 
-use ssse::{api, auth, crawler, db, settings, state};
+use ssse::{api, db, state};
 
 #[derive(Parser)]
 #[command(name = "ssse", version, about = "Super Simple Search Engine")]
@@ -66,10 +66,27 @@ async fn main() -> anyhow::Result<()> {
             let app = api::router(state.clone());
             let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
             let state_sd = state.clone();
-            axum::serve(listener, app).with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                state_sd.inner.lock().unwrap().crawl_running = false;
-            }).await?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let ctrl_c = tokio::signal::ctrl_c();
+                    #[cfg(unix)]
+                    {
+                        let mut term = tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::terminate(),
+                        )
+                        .unwrap();
+                        tokio::select! {
+                            _ = ctrl_c => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = ctrl_c.await;
+                    }
+                    state_sd.inner.lock().unwrap().crawl_running = false;
+                })
+                .await?;
             return Ok(());
         }
         _ => {}
@@ -94,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     use tokio::net::UnixStream;
                     let mut stream = UnixStream::connect(&cli.socket).await?;
-                    stream.write_all(format!("password_change\n{}\n{}\n", user, pw).as_bytes()).await?;
+                    stream
+                        .write_all(format!("password_change\n{}\n{}\n", user, pw).as_bytes())
+                        .await?;
                     stream.shutdown().await.ok();
                     let mut buf = String::new();
                     stream.read_to_string(&mut buf).await?;

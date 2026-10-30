@@ -53,9 +53,13 @@ homeForm.addEventListener('submit', (e) => { e.preventDefault(); doSearch(homeQ.
 searchForm.addEventListener('submit', (e) => { e.preventDefault(); doSearch(qInput.value); });
 
 document.querySelectorAll('.tabs button').forEach(btn => {
+  btn.setAttribute('role', 'tab');
   btn.addEventListener('click', () => {
     currentCategory = btn.dataset.cat;
-    document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b===btn));
+    document.querySelectorAll('.tabs button').forEach(b => {
+      b.classList.toggle('active', b===btn);
+      b.setAttribute('aria-selected', b===btn ? 'true' : 'false');
+    });
     currentPage = 1;
     loadResults();
   });
@@ -69,6 +73,7 @@ async function loadResults() {
   const data = await res.json();
   const list = document.getElementById('resultList');
   list.innerHTML = '';
+  list.setAttribute('aria-live', 'polite');
   if (currentCategory === 'IMAGES' || currentCategory === 'VIDEOS') {
     list.className = 'grid';
   } else {
@@ -82,6 +87,20 @@ async function loadResults() {
       img.src = currentCategory === 'IMAGES' ? r.url : (r.extra?.thumbnail || '');
       img.alt = r.description || r.title || '';
       img.onerror = () => { img.style.display='none'; };
+      if (currentCategory === 'IMAGES') {
+        img.style.cursor = 'pointer';
+        img.addEventListener('click', () => {
+          const modal = document.createElement('div');
+          modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;z-index:1000;';
+          const big = document.createElement('img');
+          big.src = r.url;
+          big.style.maxWidth = '90vw';
+          big.style.maxHeight = '90vh';
+          modal.appendChild(big);
+          modal.addEventListener('click', () => modal.remove());
+          document.body.appendChild(modal);
+        });
+      }
       div.appendChild(img);
     }
     const title = document.createElement('div');

@@ -55,13 +55,16 @@ impl AppState {
         tokio::spawn(async move {
             // remove existing
             let _ = std::fs::remove_file(&socket_path);
-            if let Some(parent) = socket_path.parent() { let _ = std::fs::create_dir_all(parent); }
+            if let Some(parent) = socket_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             // restrict perms
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
+                let _ =
+                    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
             }
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
@@ -88,8 +91,32 @@ impl AppState {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                // simple: not auto-starting; admin triggers
-                let _ = state;
+                if state.inner.lock().unwrap().crawl_running {
+                    continue;
+                }
+                // check interval
+                let last = state.inner.lock().unwrap().last_success;
+                let interval_days = state.inner.lock().unwrap().settings.crawl_interval_days;
+                let now = chrono::Utc::now().timestamp();
+                let should = match last {
+                    Some(ts) => (now - ts) > interval_days * 86400,
+                    None => true,
+                };
+                if should {
+                    // only auto-start if seed urls exist
+                    let conn = state.db();
+                    let seeds: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM seed_urls", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    if seeds > 0 {
+                        state.inner.lock().unwrap().crawl_running = true;
+                        state.inner.lock().unwrap().crawl_start = Some(now);
+                        let st = state.clone();
+                        tokio::spawn(async move {
+                            crate::crawler::run(st).await;
+                        });
+                    }
+                }
             }
         });
     }
@@ -104,7 +131,9 @@ async fn handle_cmd(state: &AppState, cmd: &str, lines: &[&str]) -> String {
             state.inner.lock().unwrap().crawl_running = true;
             state.inner.lock().unwrap().crawl_start = Some(chrono::Utc::now().timestamp());
             let st = state.clone();
-            tokio::spawn(async move { crate::crawler::run(st).await; });
+            tokio::spawn(async move {
+                crate::crawler::run(st).await;
+            });
             "started\n".to_string()
         }
         "crawl_stop" => {
@@ -119,17 +148,24 @@ async fn handle_cmd(state: &AppState, cmd: &str, lines: &[&str]) -> String {
             state.inner.lock().unwrap().crawl_running = true;
             state.inner.lock().unwrap().crawl_start = Some(chrono::Utc::now().timestamp());
             let st = state.clone();
-            tokio::spawn(async move { crate::crawler::run(st).await; });
+            tokio::spawn(async move {
+                crate::crawler::run(st).await;
+            });
             "restarted\n".to_string()
         }
         "crawl_status" => {
             let g = state.inner.lock().unwrap();
-            format!("running: {}\nprocessed: {}\nrefused: {}\n", g.crawl_running, g.processed, g.refused)
+            format!(
+                "running: {}\nprocessed: {}\nrefused: {}\n",
+                g.crawl_running, g.processed, g.refused
+            )
         }
         "password_change" => {
             let username = lines.get(1).copied().unwrap_or("admin").trim();
             let password = lines.get(2).copied().unwrap_or("").trim();
-            if password.is_empty() { return "password required\n".to_string(); }
+            if password.is_empty() {
+                return "password required\n".to_string();
+            }
             let conn = state.db();
             crate::auth::set_password(&conn, username, password);
             "password changed\n".to_string()
